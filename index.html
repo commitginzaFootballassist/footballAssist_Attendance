@@ -40,7 +40,49 @@
     .modal-actions button { flex: 1; padding: 10px; border-radius: 4px; font-weight: bold; border: none; cursor: pointer; }
     .btn-cancel { background: #6c757d; color: white; }
     .btn-save { background: #00B900; color: white; border: none; }
-    #loader { color: #00B900; font-weight: bold; text-align: center; margin-bottom: 10px; }
+    .modal-actions button:disabled { opacity: 0.6; cursor: not-allowed; }
+    #loader {
+      display: none;
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: rgba(255, 255, 255, 0.86);
+      z-index: 5000;
+      justify-content: center;
+      align-items: center;
+      text-align: center;
+      padding: 20px;
+      box-sizing: border-box;
+      color: #00B900;
+      font-weight: bold;
+    }
+    .loader-box {
+      background: #fff;
+      border-radius: 12px;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.16);
+      padding: 24px 28px;
+      min-width: 220px;
+      max-width: 90vw;
+    }
+    .loader-spinner {
+      width: 36px;
+      height: 36px;
+      border: 4px solid #d8f5d8;
+      border-top-color: #00B900;
+      border-radius: 50%;
+      margin: 0 auto 14px;
+      animation: loaderSpin 0.8s linear infinite;
+    }
+    .loader-text {
+      color: #333;
+      font-size: 15px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+    }
+    body.loading-open { overflow: hidden; }
+    @keyframes loaderSpin { to { transform: rotate(360deg); } }
 
     .bottom-bar { position: fixed; bottom: 0; left: 0; width: 100%; background: #fff; box-shadow: 0 -2px 10px rgba(0,0,0,0.1); display: flex; gap: 10px; padding: 15px; box-sizing: border-box; z-index: 1000; }
     .btn-punch { flex: 1; padding: 15px 0; font-size: 16px; font-weight: bold; border: none; border-radius: 8px; cursor: pointer; }
@@ -189,7 +231,12 @@
 </head>
 <body>
 
-  <div id="loader">通信中...</div>
+  <div id="loader" aria-live="polite" aria-busy="true">
+    <div class="loader-box">
+      <div class="loader-spinner" aria-hidden="true"></div>
+      <div id="loaderText" class="loader-text">通信中...</div>
+    </div>
+  </div>
 
   <div class="card help-card">
     <button type="button" class="help-link" onclick="openManual(event)" aria-haspopup="dialog" aria-controls="manualVideoModal">
@@ -335,8 +382,8 @@
       </div>
 
       <div class="modal-actions">
-        <button class="btn-cancel" onclick="closeModal()">キャンセル</button>
-        <button class="btn-save" onclick="saveChanges()">保存する</button>
+        <button id="btnCancelEdit" class="btn-cancel" onclick="closeModal()">キャンセル</button>
+        <button id="btnSaveEdit" class="btn-save" onclick="saveChanges()">保存する</button>
       </div>
     </div>
   </div>
@@ -385,6 +432,7 @@
     let lineUserId = "";
     let currentData = [];
     let inTimeSettings = [];
+    let isSavingAttendance = false;
 
     // 表示できる月は「先月・当月・翌月」の3つに限定する。
     const BASE_MONTH_DATE = new Date();
@@ -523,8 +571,28 @@
     
       if (callback) callback();
     }
-    function showLoader() { document.getElementById('loader').style.display = 'block'; }
-    function hideLoader() { document.getElementById('loader').style.display = 'none'; }
+
+    function showLoader(message = '通信中...') {
+      const loader = document.getElementById('loader');
+      const loaderText = document.getElementById('loaderText');
+      if (loaderText) loaderText.textContent = message;
+      if (loader) loader.style.display = 'flex';
+      document.body.classList.add('loading-open');
+    }
+
+    function hideLoader() {
+      const loader = document.getElementById('loader');
+      if (loader) loader.style.display = 'none';
+      document.body.classList.remove('loading-open');
+    }
+
+    function setEditSavingState(isSaving) {
+      isSavingAttendance = isSaving;
+      const saveBtn = document.getElementById('btnSaveEdit');
+      const cancelBtn = document.getElementById('btnCancelEdit');
+      if (saveBtn) saveBtn.disabled = isSaving;
+      if (cancelBtn) cancelBtn.disabled = isSaving;
+    }
 
     function getSelectedMonthOffset() {
       return (selectedMonthDate.getFullYear() - BASE_MONTH_DATE.getFullYear()) * 12
@@ -581,17 +649,16 @@
       fetchAttendance();
     }
 
-    function fetchAttendance() {
-      showLoader();
+    function fetchAttendance(options = {}) {
+      showLoader(options.loaderMessage || '通信中...');
       const year = selectedMonthDate.getFullYear();
       const month = selectedMonthDate.getMonth() + 1;
       const url = `${API_URL}?userId=${encodeURIComponent(lineUserId)}&year=${year}&month=${month}`;
 
-      fetch(url)
+      return fetch(url)
         .then(handleResponse)
         .then(res => {
-          hideLoader();
-          if (res.error) { alert(res.error); return; }
+          if (res.error) throw new Error(res.error);
           currentData = res.data || [];
           inTimeSettings = (res.settings && Array.isArray(res.settings.inTimes)) ? res.settings.inTimes : [];
           renderSettings();
@@ -599,8 +666,15 @@
           renderMonthlySummary();
           renderList();
           updatePunchButtons();
+          return res;
         })
-        .catch(err => { alert("一覧取得エラー:\n" + err.message); hideLoader(); });
+        .catch(err => {
+          alert("一覧取得エラー:\n" + err.message);
+          return null;
+        })
+        .finally(() => {
+          hideLoader();
+        });
     }
 
     function renderSettings() {
@@ -1108,6 +1182,8 @@
     }
 
     function saveChanges() {
+      if (isSavingAttendance) return;
+
       const type = document.getElementById('modalType').value;
       const breakTimeRaw = document.getElementById('modalBreakTime').value;
       const breakTime = normalizeBreakTime(breakTimeRaw);
@@ -1117,36 +1193,46 @@
         return;
       }
 
-      showLoader();
+      const payload = {
+        userId: lineUserId,
+        rowNum: document.getElementById('modalRowNum').value,
+        date: document.getElementById('modalDate').value,
+        inTime: type === 'holiday' ? '' : document.getElementById('modalInTime').value,
+        outTime: type === 'holiday' ? '' : document.getElementById('modalOutTime').value,
+        breakTime: type === 'holiday' ? '' : breakTime,
+        transport: type === 'holiday' ? '' : document.getElementById('modalTransport').value,
+        workType: type === 'holiday' ? WORK_TYPE_LABEL_HOLIDAY : WORK_TYPE_LABEL_WORK,
+        attendanceType: type,
+        remark: document.getElementById('modalRemark').value
+      };
+
+      setEditSavingState(true);
+      showLoader('保存しています...\n画面へ反映されるまでお待ちください');
       closeModal();
     
       fetch(API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          userId: lineUserId,
-          rowNum: document.getElementById('modalRowNum').value,
-          date: document.getElementById('modalDate').value,
-          inTime: type === 'holiday' ? '' : document.getElementById('modalInTime').value,
-          outTime: type === 'holiday' ? '' : document.getElementById('modalOutTime').value,
-          breakTime: type === 'holiday' ? '' : breakTime,
-          transport: type === 'holiday' ? '' : document.getElementById('modalTransport').value,
-          workType: type === 'holiday' ? WORK_TYPE_LABEL_HOLIDAY : WORK_TYPE_LABEL_WORK,
-          attendanceType: type,
-          remark: document.getElementById('modalRemark').value
-        })
+        body: JSON.stringify(payload)
       })
       .then(handleResponse)
       .then(res => {
-        if(res.success) {
-          fetchAttendance();
-        } else {
-          alert("保存エラー: " + res.error);
-          hideLoader();
+        if (res.success) {
+          return fetchAttendance({
+            loaderMessage: '保存しました。\n最新データを画面へ反映しています...'
+          });
         }
-      }).catch(err => {
-        alert("保存エラー詳細:\n" + err.message);
+
         hideLoader();
+        showAppAlert("保存エラー: " + (res.error || '保存に失敗しました'), 'エラー');
+        return null;
+      })
+      .catch(err => {
+        hideLoader();
+        showAppAlert("保存エラー詳細:\n" + err.message, 'エラー');
+      })
+      .finally(() => {
+        setEditSavingState(false);
       });
     }
 
