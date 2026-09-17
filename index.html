@@ -224,6 +224,12 @@
       color: #fff;
     }
 
+    .leave-policy-status { background: #f8f9fa; border: 1px solid #e5e5e5; border-radius: 6px; padding: 12px; margin-bottom: 10px; color: #555; font-size: 13px; line-height: 1.7; white-space: pre-line; overflow-wrap: anywhere; }
+    .leave-policy-status[data-state="locked"] { border-left: 4px solid #FF9800; }
+    .leave-policy-status[data-state="ready"] { border-left: 4px solid #00B900; }
+    #modalLeaveStatus { white-space: pre-line; margin-bottom: 12px; }
+    .edit-icon[aria-disabled="true"] { pointer-events: none; opacity: 0.5; }
+
     body.manual-open {
       overflow: hidden;
     }
@@ -284,6 +290,7 @@
       </div>
       <button type="button" id="nextMonthBtn" class="month-nav-btn" onclick="changeDisplayMonth(1)" aria-label="次の月へ">＞</button>
     </div>
+    <div id="leavePolicyStatus" class="leave-policy-status" role="status" aria-live="polite">公休・有給設定を確認中です。</div>
     <div id="attendanceList"></div>
   </div>
 
@@ -342,13 +349,13 @@
       <h3 id="modalTitle">勤怠の編集</h3>
       <input type="hidden" id="modalRowNum">
       <input type="hidden" id="modalDate">
+      <div id="modalLeaveStatus" class="hint" role="status"></div>
 
       <div class="form-row">
         <div class="form-group">
           <label>区分</label>
           <select id="modalType" onchange="toggleFields()">
             <option value="work">通常勤務</option>
-            <option value="holiday">公休</option>
           </select>
         </div>
         <div class="form-group" id="transportField">
@@ -421,6 +428,7 @@
     </div>
   </div>
 
+  <script src="./attendance_leave_ui.js?v=20260917-1"></script>
   <script>
     const LIFF_ID = '2009200776-63zMX8rf';
     const API_URL = 'https://cf9eor0n64.execute-api.ap-northeast-1.amazonaws.com/attendance';
@@ -429,13 +437,34 @@
     const DEFAULT_BREAK_TIME_ON_PUNCH_OUT = '01:00';
     const WORK_TYPE_LABEL_WORK = '通常勤務';
     const WORK_TYPE_LABEL_HOLIDAY = '公休';
+    const WORK_TYPE_LABEL_PAID = '有給';
+    // 日数や会社別ルールはJSへ複製せず、Lambdaの判定を利用する。
+    let attendancePayload = null;
+    let isFetchingAttendance = false;
+    let attendanceFetchVersion = 0;
+    let isPunchSubmitting = false;
+    let loadedForJstDate = '';
+
+    function getJstParts() {
+      const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Asia/Tokyo', year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+      }).formatToParts(new Date());
+      return Object.fromEntries(parts.filter(p => p.type !== 'literal').map(p => [p.type, p.value]));
+    }
+
+    function getJstDate() {
+      const p = getJstParts();
+      // 既存の日付比較関数と同じ、時刻を持たないローカルDateで表現する。
+      return new Date(Number(p.year), Number(p.month) - 1, Number(p.day));
+    }
     let lineUserId = "";
     let currentData = [];
     let inTimeSettings = [];
     let isSavingAttendance = false;
 
     // 表示できる月は「先月・当月・翌月」の3つに限定する。
-    const BASE_MONTH_DATE = new Date();
+    const BASE_MONTH_DATE = getJstDate();
     BASE_MONTH_DATE.setHours(0, 0, 0, 0);
     BASE_MONTH_DATE.setDate(1);
     let selectedMonthDate = new Date(BASE_MONTH_DATE.getFullYear(), BASE_MONTH_DATE.getMonth(), 1);
@@ -534,14 +563,27 @@
     }
 
     async function handleResponse(res) {
-      if (!res.ok) {
-        const rawText = await res.text();
-        throw new Error(`[HTTP ${res.status}] ${rawText}`);
+      const rawText = await res.text();
+      let payload;
+      try { payload = JSON.parse(rawText); }
+      catch (e) {
+        throw new Error(`応答を読み取れませんでした（HTTP ${res.status}）。保存操作を繰り返す前に一覧を再取得してください。`);
       }
-      return res.json();
+      if (!res.ok || (payload && payload.error)) {
+        const error = new Error((payload && payload.error) || `通信に失敗しました（HTTP ${res.status}）。`);
+        error.code = payload && payload.code;
+        error.payload = payload;
+        error.status = res.status;
+        throw error;
+      }
+      return payload;
     }
 
     window.onload = function() {
+      if (typeof AttendanceLeaveUI === 'undefined') {
+        showAppAlert('attendance_leave_ui.js を読み込めません。HTMLと同じフォルダーに配置してください。', '画面ファイルの読込みエラー');
+        return;
+      }
       liff.init({ liffId: LIFF_ID }).then(() => {
         if (!liff.isLoggedIn()) liff.login();
         else {
@@ -592,6 +634,7 @@
       const cancelBtn = document.getElementById('btnCancelEdit');
       if (saveBtn) saveBtn.disabled = isSaving;
       if (cancelBtn) cancelBtn.disabled = isSaving;
+      updatePunchButtons();
     }
 
     function getSelectedMonthOffset() {
@@ -638,6 +681,8 @@
     }
 
     function changeDisplayMonth(delta) {
+      if (isSavingAttendance || isPunchSubmitting) return;
+      syncBaseMonth();
       const nextOffset = getSelectedMonthOffset() + delta;
       if (nextOffset < MIN_MONTH_OFFSET || nextOffset > MAX_MONTH_OFFSET) return;
 
@@ -649,32 +694,129 @@
       fetchAttendance();
     }
 
-    function fetchAttendance(options = {}) {
-      showLoader(options.loaderMessage || '通信中...');
+    async function fetchAttendance(options = {}) {
+      syncBaseMonth();
+      const version = ++attendanceFetchVersion;
       const year = selectedMonthDate.getFullYear();
       const month = selectedMonthDate.getMonth() + 1;
+      isFetchingAttendance = true;
+      attendancePayload = null; // 別月や取得失敗時に前の許可結果を流用しない。
+      updatePunchButtons();
+      renderMonthNavigation();
+      renderLeaveStatus();
+      showLoader(options.loaderMessage || '通信中...');
       const url = `${API_URL}?userId=${encodeURIComponent(lineUserId)}&year=${year}&month=${month}`;
-
-      return fetch(url)
-        .then(handleResponse)
-        .then(res => {
-          if (res.error) throw new Error(res.error);
-          currentData = res.data || [];
-          inTimeSettings = (res.settings && Array.isArray(res.settings.inTimes)) ? res.settings.inTimes : [];
-          renderSettings();
-          renderMonthNavigation();
-          renderMonthlySummary();
-          renderList();
-          updatePunchButtons();
-          return res;
-        })
-        .catch(err => {
-          alert("一覧取得エラー:\n" + err.message);
-          return null;
-        })
-        .finally(() => {
+      try {
+        const res = await fetch(url, { cache: 'no-store' }).then(handleResponse);
+        if (version !== attendanceFetchVersion) return null;
+        if (!res || !Array.isArray(res.data)) throw new Error('勤怠一覧の応答形式が不正です。');
+        if (!res.view || res.view.year !== year || res.view.month !== month) {
+          throw new Error('表示月と取得した勤怠の月が一致しません。再読込みしてください。');
+        }
+        currentData = res.data;
+        attendancePayload = res;
+        const evaluatedDate = res.leavePolicy && res.leavePolicy.punchGate && res.leavePolicy.punchGate.evaluatedDateJst;
+        loadedForJstDate = normalizeDateString(evaluatedDate || getTodayStr());
+        inTimeSettings = (res.settings && Array.isArray(res.settings.inTimes)) ? res.settings.inTimes : [];
+        renderSettings();
+        renderMonthNavigation();
+        renderMonthlySummary();
+        renderLeaveStatus();
+        renderList();
+        return res;
+      } catch (err) {
+        if (version !== attendanceFetchVersion) return null;
+        currentData = [];
+        attendancePayload = null;
+        renderMonthlySummary();
+        renderList();
+        renderLeaveStatus('勤怠一覧を取得できませんでした。画面を再読込みしてください。');
+        if (!options.silentError) showAppAlert('一覧取得エラー:\n' + err.message, '通信エラー');
+        return null;
+      } finally {
+        if (version === attendanceFetchVersion) {
+          isFetchingAttendance = false;
+          if (attendancePayload) renderLeaveStatus();
           hideLoader();
-        });
+          renderMonthNavigation();
+          updatePunchButtons();
+        }
+      }
+    }
+
+    function syncBaseMonth() {
+      const current = getJstDate();
+      current.setDate(1);
+      if (current.getTime() === BASE_MONTH_DATE.getTime()) return false;
+      const wasCurrent = getSelectedMonthOffset() === 0;
+      BASE_MONTH_DATE.setFullYear(current.getFullYear(), current.getMonth(), 1);
+      if (wasCurrent) selectedMonthDate = new Date(BASE_MONTH_DATE);
+      else {
+        const offset = Math.max(MIN_MONTH_OFFSET, Math.min(MAX_MONTH_OFFSET, getSelectedMonthOffset()));
+        selectedMonthDate = new Date(BASE_MONTH_DATE.getFullYear(), BASE_MONTH_DATE.getMonth() + offset, 1);
+      }
+      return true;
+    }
+
+    function refreshOnJstDateChange() {
+      if (!lineUserId || !loadedForJstDate || document.visibilityState === 'hidden') return;
+      if (isFetchingAttendance || isSavingAttendance || isPunchSubmitting) return;
+      if (loadedForJstDate !== getTodayStr()) {
+        closePunchInModal();
+        closePunchOutModal();
+        fetchAttendance({ loaderMessage: '日付が変わりました。最新の勤怠を取得しています...' });
+      }
+    }
+    document.addEventListener('visibilitychange', refreshOnJstDateChange);
+    window.addEventListener('focus', refreshOnJstDateChange);
+    // 通信は日付が変わった場合のみ。毎分Sheetsへ問い合わせる処理ではない。
+    window.setInterval(refreshOnJstDateChange, 60000);
+
+    function renderLeaveStatus(failureMessage = '') {
+      const el = document.getElementById('leavePolicyStatus');
+      if (!el) return;
+      const policy = attendancePayload && attendancePayload.leavePolicy;
+      if (!policy || typeof AttendanceLeaveUI === 'undefined') {
+        el.dataset.state = 'locked';
+        el.textContent = failureMessage || (isFetchingAttendance
+          ? '公休・有給設定を確認中です。'
+          : '公休・有給設定を取得できません。更新版Lambdaを反映して、画面を再読込みしてください。');
+        return;
+      }
+      const gate = AttendanceLeaveUI.gate(attendancePayload);
+      const source = policy.companySource || {};
+      const period = source.period === 'CURRENT_MONTH' ? '当月' : source.period === 'NEXT_MONTH' ? '翌月' : '対象月';
+      const lines = [];
+      if (policy.company) lines.push(`所属企業（${period}）：${policy.company}`);
+      if (policy.configured && policy.viewMonth) {
+        const m = policy.viewMonth;
+        lines.push(`${m.year}年${m.month}月　公休 ${m.scheduledHolidays}/${m.requiredHolidays}日・有給 ${m.scheduledPaidLeave}/${m.requiredPaidLeave}日`);
+      } else lines.push(policy.error || '対象月の公休・有給ルールを取得できません。');
+      if (gate.active === false && gate.allowed === true) {
+        lines.push('2026年9月以前の打刻は、今回の公休・有給の設定状況による制限対象外です。');
+      } else if (gate.allowed === true) {
+        lines.push('この月の公休・有給設定は完了しています。他の月の未設定は、この月の打刻に影響しません。');
+      } else if (policy.configured) {
+        lines.push('この月の公休・有給がそれぞれ必要日数と一致するまで、この月の出勤・退勤はできません。鉛筆から休みの日付を設定してください。');
+      } else {
+        lines.push('所属企業・設定を確認できるまで、この月の打刻と新しい休みの登録はできません。既存実績の通常編集は可能です。');
+      }
+      if (getSelectedMonthOffset() !== 0) lines.push('本日の出勤・退勤ボタンは、当月を表示したときに利用できます。');
+      el.dataset.state = gate.allowed === true ? 'ready' : 'locked';
+      el.textContent = lines.join('\n');
+    }
+
+    function getTypeLabel(code) {
+      return { work: WORK_TYPE_LABEL_WORK, holiday: WORK_TYPE_LABEL_HOLIDAY, paid_leave: WORK_TYPE_LABEL_PAID }[code] || '';
+    }
+
+    function openModalForDate(dateStr) {
+      if (isFetchingAttendance || isSavingAttendance || isPunchSubmitting) return;
+      const date = normalizeDateString(dateStr);
+      const row = currentData.find(item => normalizeDateString(item.date) === date);
+      if (!row) { showAppAlert('編集対象の行を再取得してください。'); return; }
+      openModal(row.rowNum == null ? '' : String(row.rowNum), row.date, row.inTime, row.outTime,
+        row.breakTime, getRemarkForDisplay(row), row.transport, getRowWorkTypeRaw(row));
     }
 
     function renderSettings() {
@@ -779,6 +921,7 @@
       const raw = String(value || '').trim();
       const lowered = raw.toLowerCase();
       if (raw === WORK_TYPE_LABEL_HOLIDAY || lowered === 'holiday') return 'holiday';
+      if (raw === WORK_TYPE_LABEL_PAID || lowered === 'paid' || lowered === 'paid_leave') return 'paid_leave';
       if (raw === WORK_TYPE_LABEL_WORK || lowered === 'work') return 'work';
       return '';
     }
@@ -800,6 +943,10 @@
       return getTypeCodeFromValues(getRowWorkTypeRaw(row), row ? row.remark : '') === 'holiday';
     }
 
+    function isLeaveRow(row) {
+      return ['holiday', 'paid_leave'].includes(getTypeCodeFromValues(getRowWorkTypeRaw(row), row ? row.remark : ''));
+    }
+
     function getRemarkForDisplay(row) {
       if (!row) return '';
       const hasExplicitType = Boolean(normalizeAttendanceTypeValue(getRowWorkTypeRaw(row)));
@@ -811,7 +958,7 @@
     }
 
     function getDailyWorkMinutes(row) {
-      if (!row || isHolidayRow(row)) return null;
+      if (!row || isLeaveRow(row)) return null;
       if (!row.inTime || !row.outTime) return null;
 
       const inMin = timeToMinutes(row.inTime);
@@ -835,7 +982,7 @@
 
       currentData.forEach(row => {
         if (!isSelectedMonthDate(row.date)) return;
-        if (isHolidayRow(row)) return;
+        if (isLeaveRow(row)) return;
 
         const workMinutes = getDailyWorkMinutes(row);
         if (workMinutes === null) {
@@ -879,8 +1026,7 @@
 
     function renderList() {
       let html = "";
-      const today = new Date();
-      today.setHours(0,0,0,0);
+      const today = getJstDate();
       const rows = currentData.filter(row => isSelectedMonthDate(row.date));
 
       if (!rows.length) {
@@ -902,22 +1048,19 @@
         }
     
         const breakDisplay = row.breakTime ? row.breakTime : '未入力';
-        const isHoliday = isHolidayRow(row);
+        const isLeave = isLeaveRow(row);
+        const rowTypeCode = getTypeCodeFromValues(getRowWorkTypeRaw(row), row.remark);
         const remarkDisplay = getRemarkForDisplay(row);
     
         let displayMsg = "--:-- / --:--";
-        if (isHoliday) {
-          displayMsg = "【公休】";
+        if (isLeave) {
+          displayMsg = rowTypeCode === 'paid_leave' ? '【有給】' : '【公休】';
         } else if (row.inTime || row.outTime || row.breakTime) {
-          displayMsg = `出勤: ${row.inTime || '--:--'} / 退勤: ${row.outTime || '--:--'} / 休憩: ${breakDisplay}`;
+          displayMsg = `出勤: ${escapeHtml(row.inTime || '--:--')} / 退勤: ${escapeHtml(row.outTime || '--:--')} / 休憩: ${escapeHtml(breakDisplay)}`;
         } else if (isFuture) {
           displayMsg = "<span style='color:#ccc'>未打刻</span>";
         }
     
-        const passRowNum = (row.rowNum === null || row.rowNum === undefined) ? "" : row.rowNum;
-        const passTransport = row.transport ? row.transport : "";
-        const passBreakTime = row.breakTime ? row.breakTime : "";
-        const passWorkType = getRowWorkTypeRaw(row);
     
         html += `
           <div class="list-item ${bgClass}">
@@ -925,10 +1068,10 @@
               <strong>${escapeHtml(dateWithWeekday)}${isToday ? '<span style="color:#00B900;font-size:12px;margin-left:6px;">本日</span>' : ''}</strong><br>
               <span style="font-size:14px; color:#666;">${displayMsg}</span>
               ${remarkDisplay ? `<br><small style="color:#999">備考: ${escapeHtml(remarkDisplay)}</small>` : ''}
-              ${row.breakTime ? `<br><small style="color:#999">休憩時間: ${escapeHtml(row.breakTime)}</small>` : ''}
-              ${row.transport ? `<br><small style="color:#999">交通費: ${escapeHtml(row.transport)}円</small>` : ''}
+              ${!isLeave && row.breakTime ? `<br><small style="color:#999">休憩時間: ${escapeHtml(row.breakTime)}</small>` : ''}
+              ${!isLeave && row.transport ? `<br><small style="color:#999">交通費: ${escapeHtml(row.transport)}円</small>` : ''}
             </div>
-            <div class="edit-icon" onclick="openModal('${escapeAttr(passRowNum)}', '${escapeAttr(row.date)}', '${escapeAttr(row.inTime)}', '${escapeAttr(row.outTime)}', '${escapeAttr(passBreakTime)}', '${escapeAttr(remarkDisplay)}', '${escapeAttr(passTransport)}', '${escapeAttr(passWorkType)}')">✏️</div>
+            <div class="edit-icon" role="button" tabindex="0" aria-label="${escapeAttr(dateWithWeekday)}を編集" data-edit-date="${escapeAttr(row.date)}" onclick="openModalForDate(this.dataset.editDate)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openModalForDate(this.dataset.editDate);}">✏️</div>
           </div>`;
       });
     
@@ -936,27 +1079,30 @@
     }
 
     function updatePunchButtons() {
-      const d = new Date();
-      const todayStr = `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,'0')}/${String(d.getDate()).padStart(2,'0')}`;
-      const todayEntry = currentData.find(r => r.date === todayStr);
+      const todayStr = getTodayStr();
+      const todayEntry = currentData.find(r => normalizeDateString(r.date) === todayStr);
       const btnIn = document.getElementById('btnIn');
       const btnOut = document.getElementById('btnOut');
-
-      btnIn.disabled = true;
-      btnOut.disabled = true;
-
-      // 先月/翌月を表示している間は、本日の打刻ボタンは無効にする。
-      if (getSelectedMonthOffset() !== 0) return;
-      if (!todayEntry) return;
-      if (isHolidayRow(todayEntry)) return;
-
-      if (!todayEntry.inTime) btnIn.disabled = false;
-      else if (todayEntry.inTime && !todayEntry.outTime) btnOut.disabled = false;
+      if (!btnIn || !btnOut) return;
+      const busy = isFetchingAttendance || isSavingAttendance || isPunchSubmitting;
+      const invalidContext = getSelectedMonthOffset() !== 0 || !isSelectedMonthDate(todayStr)
+        || loadedForJstDate !== todayStr || !todayEntry || isLeaveRow(todayEntry);
+      const disabledIn = busy || invalidContext || Boolean(todayEntry && todayEntry.inTime);
+      const disabledOut = busy || invalidContext || !todayEntry || !todayEntry.inTime || Boolean(todayEntry.outTime);
+      if (typeof AttendanceLeaveUI === 'undefined') {
+        btnIn.disabled = true;
+        btnOut.disabled = true;
+        return;
+      }
+      AttendanceLeaveUI.applyPunchButton(btnIn, attendancePayload, Boolean(disabledIn), todayStr);
+      AttendanceLeaveUI.applyPunchButton(btnOut, attendancePayload, Boolean(disabledOut), todayStr);
+      const reason = AttendanceLeaveUI.gate(attendancePayload, todayStr);
+      btnIn.title = btnOut.title = reason.allowed === true ? '' : (reason.message || '公休・有給の設定が未完了です。');
     }
 
     function getTodayStr() {
-      const d = new Date();
-      return `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,'0')}/${String(d.getDate()).padStart(2,'0')}`;
+      const p = getJstParts();
+      return `${p.year}/${p.month}/${p.day}`;
     }
 
     function normalizeDateString(value) {
@@ -974,8 +1120,30 @@
     }
 
     function getCurrentTimeStr() {
-      const d = new Date();
-      return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+      const p = getJstParts();
+      return `${p.hour}:${p.minute}`;
+    }
+
+    function assertPunchAllowed(type, modalDate) {
+      if (!['in', 'out'].includes(type)) throw new Error('打刻区分が不正です。');
+      if (isFetchingAttendance || isSavingAttendance || isPunchSubmitting) throw new Error('保存・読込み処理中です。');
+      const today = getTodayStr();
+      if (modalDate && normalizeDateString(modalDate) !== today) {
+        throw new Error('日付が変わりました。出勤・退勤の画面を開き直してください。');
+      }
+      if (loadedForJstDate !== today) {
+        refreshOnJstDateChange();
+        throw new Error('最新の日付の勤怠を確認しています。読込み後にもう一度操作してください。');
+      }
+      if (getSelectedMonthOffset() !== 0 || !isSelectedMonthDate(today)) throw new Error('当月の勤怠一覧に戻ってから打刻してください。');
+      const entry = currentData.find(r => normalizeDateString(r.date) === today);
+      if (!entry) throw new Error('本日の勤怠行が見つかりません。再読込みしてください。');
+      if (isLeaveRow(entry)) throw new Error('公休・有給の日には打刻できません。');
+      AttendanceLeaveUI.assertCanPunch(attendancePayload, today);
+      if (type === 'in' && entry.inTime) throw new Error('本日は出勤打刻済みです。訂正は鉛筆から行ってください。');
+      if (type === 'out' && !entry.inTime) throw new Error('出勤時刻が未登録のため退勤できません。');
+      if (type === 'out' && entry.outTime) throw new Error('本日は退勤打刻済みです。訂正は鉛筆から行ってください。');
+      return entry;
     }
 
     function punch(type) {
@@ -989,6 +1157,8 @@
     }
 
     function openPunchInModal() {
+      try { assertPunchAllowed('in'); }
+      catch (err) { showAppAlert(err.message, '打刻できません'); return; }
       const todayStr = getTodayStr();
       const todayEntry = currentData.find(r => r.date === todayStr);
       if (!todayEntry) { alert("本日の勤怠行が見つかりません"); return; }
@@ -1010,6 +1180,8 @@
     }
 
     function confirmPunchIn() {
+      try { assertPunchAllowed('in', document.getElementById('punchInDate').value); }
+      catch (err) { closePunchInModal(); showAppAlert(err.message, '打刻できません'); return; }
       const selectedTime = normalizeTime(document.getElementById('punchInTimeSelect').value);
       if (!selectedTime) { alert("出勤時刻を選択してください"); return; }
       closePunchInModal();
@@ -1021,6 +1193,8 @@
     }
 
     function openPunchOutModal() {
+      try { assertPunchAllowed('out'); }
+      catch (err) { showAppAlert(err.message, '打刻できません'); return; }
       const todayStr = getTodayStr();
       const todayEntry = currentData.find(r => r.date === todayStr);
       if (!todayEntry) { alert("本日の勤怠行が見つかりません"); return; }
@@ -1039,6 +1213,8 @@
     }
 
     function confirmPunchOut() {
+      try { assertPunchAllowed('out', document.getElementById('punchOutDate').value); }
+      catch (err) { closePunchOutModal(); showAppAlert(err.message, '打刻できません'); return; }
       const selectedTime = normalizeTime(document.getElementById('punchOutTime').value);
       if (!selectedTime) { alert("退勤時刻を選択してください"); return; }
 
@@ -1055,111 +1231,94 @@
       sendPunch('out', selectedTime);
     }
 
-    function sendPunch(type, timeStr) {
-      document.getElementById('btnIn').disabled = true;
-      document.getElementById('btnOut').disabled = true;
-      showLoader();
-
+    async function sendPunch(type, timeStr) {
+      let todayEntry;
+      try {
+        todayEntry = assertPunchAllowed(type);
+        timeStr = normalizeTime(timeStr);
+        if (!timeStr) throw new Error('打刻する時刻を選択してください。');
+      } catch (err) { showAppAlert(err.message, '打刻できません'); return; }
       const todayStr = getTodayStr();
-      const todayEntry = currentData.find(r => r.date === todayStr);
-
+      isPunchSubmitting = true;
+      updatePunchButtons();
+      showLoader();
       let payload = {
         userId: lineUserId,
         date: todayStr,
         punchType: type,
-        rowNum: (todayEntry && todayEntry.rowNum) ? String(todayEntry.rowNum) : "",
-        remark: (todayEntry && todayEntry.remark) ? todayEntry.remark : "",
-        transport: (todayEntry && todayEntry.transport) ? todayEntry.transport : "",
+        rowNum: todayEntry.rowNum ? String(todayEntry.rowNum) : '',
+        remark: todayEntry.remark || '',
+        transport: todayEntry.transport || '',
         workType: WORK_TYPE_LABEL_WORK,
         attendanceType: 'work'
       };
-
       if (type === 'in') {
         payload.inTime = timeStr;
-        payload.outTime = todayEntry ? todayEntry.outTime : "";
-      } else if (type === 'out') {
-        payload.inTime = todayEntry ? todayEntry.inTime : "";
+        payload.outTime = todayEntry.outTime || '';
+      } else {
+        payload.inTime = todayEntry.inTime || '';
         payload.outTime = timeStr;
         payload.autoBreakTimeIfEmpty = DEFAULT_BREAK_TIME_ON_PUNCH_OUT;
       }
-
-      fetch(API_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      })
-      .then(handleResponse)
-      .then(res => {
+      try {
+        payload = AttendanceLeaveUI.prepareAttendanceBody(payload);
+        const res = await fetch(API_URL, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+        }).then(handleResponse);
+        if (!res.success) throw new Error(res.error || '打刻に失敗しました。');
+        const refreshed = await fetchAttendance({ silentError: true, loaderMessage: '打刻しました。最新の勤怠を取得しています...' });
+        showAppAlert(`${type === 'in' ? '出勤' : '退勤'}を打刻しました：${timeStr}`
+          + (refreshed ? '' : '\n保存は完了しましたが一覧を再取得できませんでした。再打刻せず、画面を再読込みしてください。'), '打刻完了');
+      } catch (err) {
+        // 別端末・会社変更で判定が変わった場合も、サーバーの最新状態へ戻す。
+        await fetchAttendance({ silentError: true });
+        showAppAlert('打刻エラー:\n' + err.message, '打刻できません');
+      } finally {
+        isPunchSubmitting = false;
         hideLoader();
-      
-        if (res.success) {
-          showAppAlert(
-            `${type === 'in' ? '出勤' : '退勤'}を打刻しました：${timeStr}`,
-            '打刻完了',
-            fetchAttendance
-          );
-        } else {
-          showAppAlert(
-            "エラー: " + res.error,
-            'エラー',
-            fetchAttendance
-          );
-        }
-      })
-      .catch(err => {
-        hideLoader();
-      
-        showAppAlert(
-          "打刻エラー詳細:\n" + err.message,
-          'エラー',
-          updatePunchButtons
-        );
-      });
+        updatePunchButtons();
+      }
     }
 
     function openModal(rowNum, dateStr, inTime, outTime, breakTime, remark, transport, workType) {
-      document.getElementById('modalRowNum').value =
-        (rowNum === "Math" || rowNum === "" || rowNum === "null") ? "" : rowNum;
-
+      if (isFetchingAttendance || isSavingAttendance || isPunchSubmitting) return;
+      const date = normalizeDateString(dateStr);
+      const row = currentData.find(item => normalizeDateString(item.date) === date);
+      if (!row || !attendancePayload) { showAppAlert('対象月の勤怠を再取得してください。'); return; }
       const explicitType = normalizeAttendanceTypeValue(workType);
       const typeCode = getTypeCodeFromValues(workType, remark);
       const remarkForEdit = (!explicitType && String(remark || '').trim() === WORK_TYPE_LABEL_HOLIDAY) ? '' : remark;
-    
-      document.getElementById('modalDate').value = dateStr;
-      document.getElementById('modalTitle').innerText = `${formatDateWithWeekday(dateStr)} の編集`;
+      const modalType = document.getElementById('modalType');
+      try {
+        AttendanceLeaveUI.fillWorkTypeSelect(modalType,
+          { ...row, workType: getTypeLabel(typeCode) }, normalizeAttendanceTypeValue);
+      } catch (err) { showAppAlert(err.message, '勤務区分を確認できません'); return; }
+      document.getElementById('modalRowNum').value =
+        (rowNum === 'Math' || rowNum === '' || rowNum === 'null' || rowNum == null) ? '' : String(rowNum);
+      document.getElementById('modalDate').value = date;
+      document.getElementById('modalTitle').innerText = `${formatDateWithWeekday(date)} の編集`;
       document.getElementById('modalRemark').value = remarkForEdit || '';
       document.getElementById('modalTransport').value = transport || '';
       document.getElementById('modalInTime').value = inTime || '';
       document.getElementById('modalOutTime').value = outTime || '';
-    
-      // 鉛筆編集では、休憩時間を自動入力しない。既存値がある場合だけ表示する。
+      // 鉛筆編集では既存値だけを表示し、休憩を自動入力しない。
       document.getElementById('modalBreakTime').value = normalizeBreakTime(breakTime);
-    
-      const targetDate = parseDateOnly(dateStr);
-      const today = parseDateOnly(getTodayStr());
-      const isFuture = targetDate && today && targetDate > today;
-    
-      const modalType = document.getElementById('modalType');
       modalType.disabled = false;
-
-      if (isFuture) {
-        // 明日以降で、M列の区分も勤務データもない行はデフォルトを公休にする。
-        const hasWorkData = Boolean(inTime || outTime || breakTime || transport || remarkForEdit || explicitType);
-
-        if (!explicitType && !hasWorkData) {
-          modalType.value = 'holiday';
-          document.getElementById('modalInTime').value = '';
-          document.getElementById('modalOutTime').value = '';
-          document.getElementById('modalBreakTime').value = '';
-          document.getElementById('modalTransport').value = '';
-        } else {
-          modalType.value = typeCode;
-        }
-      } else {
-        // 今日以前は、M列の区分を優先して通常勤務/公休を判定する。
-        modalType.value = typeCode;
+      const targetDate = parseDateOnly(date);
+      const isFuture = targetDate && targetDate > getJstDate();
+      const hasWorkData = Boolean(inTime || outTime || breakTime || transport || remarkForEdit || explicitType);
+      if (isFuture && !hasWorkData) {
+        // 未来の空欄は、現在登録可能な休み（公休→有給）を初期選択する。
+        const available = Array.from(modalType.options).map(option => option.value);
+        modalType.value = available.includes('holiday') ? 'holiday'
+          : available.includes('paid_leave') ? 'paid_leave' : 'work';
       }
-    
+      const policy = attendancePayload.leavePolicy;
+      const info = document.getElementById('modalLeaveStatus');
+      if (policy && policy.configured && policy.viewMonth) {
+        const m = policy.viewMonth;
+        info.textContent = `${policy.company}\n${m.year}年${m.month}月：公休 ${m.scheduledHolidays}/${m.requiredHolidays}日・有給 ${m.scheduledPaidLeave}/${m.requiredPaidLeave}日`;
+      } else info.textContent = (policy && policy.error) || '公休・有給設定を取得できません。';
       toggleFields();
       document.getElementById('editModal').style.display = 'flex';
     }
@@ -1174,66 +1333,65 @@
     function closeModal() { document.getElementById('editModal').style.display = 'none'; }
 
     function toggleFields() {
-      const isHoliday = document.getElementById('modalType').value === 'holiday';
-    
-      document.getElementById('timeFields').style.display = isHoliday ? 'none' : 'flex';
-      document.getElementById('breakField').style.display = isHoliday ? 'none' : 'flex';
-      document.getElementById('transportField').style.display = isHoliday ? 'none' : 'block';
+      const isLeave = AttendanceLeaveUI.isLeave(document.getElementById('modalType').value);
+      document.getElementById('timeFields').style.display = isLeave ? 'none' : 'flex';
+      document.getElementById('breakField').style.display = isLeave ? 'none' : 'flex';
+      document.getElementById('transportField').style.display = isLeave ? 'none' : 'block';
     }
 
-    function saveChanges() {
-      if (isSavingAttendance) return;
-
+    async function saveChanges() {
+      if (isSavingAttendance || isFetchingAttendance || isPunchSubmitting) return;
       const type = document.getElementById('modalType').value;
+      const targetDate = normalizeDateString(document.getElementById('modalDate').value);
+      const row = currentData.find(item => normalizeDateString(item.date) === targetDate);
       const breakTimeRaw = document.getElementById('modalBreakTime').value;
       const breakTime = normalizeBreakTime(breakTimeRaw);
-
-      if (type !== 'holiday' && breakTimeRaw && !breakTime) {
-        showAppAlert('休憩時間は HH:mm 形式で入力してください。', '入力エラー');
-        return;
-      }
-
-      const payload = {
-        userId: lineUserId,
-        rowNum: document.getElementById('modalRowNum').value,
-        date: document.getElementById('modalDate').value,
-        inTime: type === 'holiday' ? '' : document.getElementById('modalInTime').value,
-        outTime: type === 'holiday' ? '' : document.getElementById('modalOutTime').value,
-        breakTime: type === 'holiday' ? '' : breakTime,
-        transport: type === 'holiday' ? '' : document.getElementById('modalTransport').value,
-        workType: type === 'holiday' ? WORK_TYPE_LABEL_HOLIDAY : WORK_TYPE_LABEL_WORK,
-        attendanceType: type,
-        remark: document.getElementById('modalRemark').value
-      };
-
+      let payload;
+      try {
+        if (!row || !attendancePayload) throw new Error('対象月の勤怠を再取得してください。');
+        const label = getTypeLabel(type);
+        const allowedTypes = AttendanceLeaveUI.choices(row).map(item => item.value);
+        if (!label || !allowedTypes.includes(label)) throw new Error('この勤務区分は現在選択できません。対象月の設定を再取得してください。');
+        const isLeave = AttendanceLeaveUI.isLeave(type);
+        if (!isLeave && breakTimeRaw && !breakTime) throw new Error('休憩時間は HH:mm 形式で入力してください。');
+        payload = AttendanceLeaveUI.prepareAttendanceBody({
+          userId: lineUserId,
+          rowNum: document.getElementById('modalRowNum').value,
+          date: targetDate,
+          inTime: document.getElementById('modalInTime').value,
+          outTime: document.getElementById('modalOutTime').value,
+          breakTime,
+          transport: document.getElementById('modalTransport').value,
+          workType: label,
+          attendanceType: type,
+          remark: document.getElementById('modalRemark').value
+        });
+        // 鉛筆から今日/未来の空欄に初めて時刻を入れる場合も同月を確認。
+        // 休みの登録、過去日編集、既存時刻の訂正には一律の打刻ロックを掛けない。
+        const target = parseDateOnly(targetDate);
+        if (!isLeave && target && target >= getJstDate()
+            && ((payload.inTime && !row.inTime) || (payload.outTime && !row.outTime))) {
+          AttendanceLeaveUI.assertCanPunch(attendancePayload, targetDate);
+        }
+      } catch (err) { showAppAlert(err.message, '保存内容を確認してください'); return; }
       setEditSavingState(true);
       showLoader('保存しています...\n画面へ反映されるまでお待ちください');
       closeModal();
-    
-      fetch(API_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      })
-      .then(handleResponse)
-      .then(res => {
-        if (res.success) {
-          return fetchAttendance({
-            loaderMessage: '保存しました。\n最新データを画面へ反映しています...'
-          });
-        }
-
-        hideLoader();
-        showAppAlert("保存エラー: " + (res.error || '保存に失敗しました'), 'エラー');
-        return null;
-      })
-      .catch(err => {
-        hideLoader();
-        showAppAlert("保存エラー詳細:\n" + err.message, 'エラー');
-      })
-      .finally(() => {
+      try {
+        const res = await fetch(API_URL, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+        }).then(handleResponse);
+        if (!res.success) throw new Error(res.error || '保存に失敗しました。');
+        const refreshed = await fetchAttendance({ silentError: true, loaderMessage: '保存しました。\n最新データを画面へ反映しています...' });
+        if (!refreshed) showAppAlert('保存は完了しましたが一覧を再取得できませんでした。再保存せず、画面を再読込みしてください。', '保存完了・再読込みが必要です');
+      } catch (err) {
+        await fetchAttendance({ silentError: true });
+        showAppAlert('保存エラー:\n' + err.message, '保存できません');
+      } finally {
         setEditSavingState(false);
-      });
+        hideLoader();
+        updatePunchButtons();
+      }
     }
 
     function escapeHtml(value) {
