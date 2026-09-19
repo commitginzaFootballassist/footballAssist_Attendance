@@ -227,7 +227,6 @@
     .leave-policy-status { background: #f8f9fa; border: 1px solid #e5e5e5; border-radius: 6px; padding: 12px; margin-bottom: 10px; color: #555; font-size: 13px; line-height: 1.7; white-space: pre-line; overflow-wrap: anywhere; }
     .leave-policy-status[data-state="locked"] { border-left: 4px solid #FF9800; }
     .leave-policy-status[data-state="ready"] { border-left: 4px solid #00B900; }
-    #modalLeaveStatus { white-space: pre-line; margin-bottom: 12px; }
     .edit-icon[aria-disabled="true"] { pointer-events: none; opacity: 0.5; }
 
     body.manual-open {
@@ -349,7 +348,6 @@
       <h3 id="modalTitle">勤怠の編集</h3>
       <input type="hidden" id="modalRowNum">
       <input type="hidden" id="modalDate">
-      <div id="modalLeaveStatus" class="hint" role="status"></div>
 
       <div class="form-row">
         <div class="form-group">
@@ -381,7 +379,6 @@
         <div class="form-group">
           <label>休憩時間</label>
           <input type="time" id="modalBreakTime" step="60">
-          <div class="hint">退勤ボタン押下時に、未入力なら1時間が自動設定されます。鉛筆編集では必要な場合だけ入力・修正してください。</div>
         </div>
       </div>
 
@@ -1301,9 +1298,6 @@
         modalType.value = available.includes('holiday') ? 'holiday'
           : available.includes('paid_leave') ? 'paid_leave' : 'work';
       }
-      const policy = attendancePayload.leavePolicy;
-      const info = document.getElementById('modalLeaveStatus');
-      info.textContent = AttendanceLeaveUI.statusText(attendancePayload, date);
       toggleFields();
       document.getElementById('editModal').style.display = 'flex';
     }
