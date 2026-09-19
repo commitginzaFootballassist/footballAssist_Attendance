@@ -1,7 +1,7 @@
 /*
  * 既存の画面へ組み込む公休・有給連携ヘルパー。
  * HTML/CSS、既存のfetch、保存イベントは書き換えない。
- * このJSを読み込むだけでは画面は変わらない。FRONTEND_INTEGRATION.mdを参照。
+ * 同梱index.htmlは組込み済み。M列の入社日判定はLambdaが行う。
  */
 (function (root, factory) {
   'use strict';
@@ -72,7 +72,8 @@
 
   /** targetDate省略時はpayloadの表示月/保存月。対象日を渡す利用を推奨。 */
   function gate(payload, targetDate) {
-    const value = payload && payload.leavePolicy && payload.leavePolicy.punchGate;
+    const policy = payload && payload.leavePolicy;
+    let value = policy && policy.punchGate;
     if (!value) {
       return { allowed: false, code: 'LEAVE_POLICY_NOT_LOADED', message: '公休・有給設定を確認中です。画面を再読込みしてください。' };
     }
@@ -86,6 +87,24 @@
           || value.target.year !== expected.year || value.target.month !== expected.month) {
         return { allowed: false, code: 'LEAVE_POLICY_MONTH_MISMATCH',
           message: `${expected.year}年${expected.month}月の公休・有給設定を再取得してください。別の月の判定は使用できません。` };
+      }
+      // 月途中で入社6か月に達する場合は、月初の免除結果を流用しない。
+      // 対象日別の結果はLambdaが判定済みで、ブラウザ側で付与資格を推測しない。
+      if (policy.punchGatesByDate) {
+        const match = /^(\d{4})[/-](\d{1,2})[/-](\d{1,2})$/.exec(String(targetDate).trim());
+        const key = `${match[1]}/${String(Number(match[2])).padStart(2, '0')}/${String(Number(match[3])).padStart(2, '0')}`;
+        const daily = policy.punchGatesByDate[key];
+        if (!daily || daily.scope !== 'TARGET_MONTH' || !daily.target
+            || daily.target.year !== expected.year || daily.target.month !== expected.month) {
+          return { allowed: false, code: 'LEAVE_POLICY_DATE_NOT_LOADED',
+            message: '対象日の公休・有給設定を再取得してください。' };
+        }
+        value = { ...value, ...daily, exemptReason: daily.exemptReason || '' };
+        value.requiredMonths = daily.active === true ? [daily.target] : [];
+        value.targetMonth = daily.active === true ? (policy.viewMonth || null) : null;
+        value.checkedMonths = value.targetMonth ? [value.targetMonth] : [];
+        value.incompleteMonths = daily.code === 'TARGET_MONTH_LEAVE_INCOMPLETE' && value.targetMonth
+          ? [value.targetMonth] : [];
       }
     }
     return value;
@@ -115,13 +134,41 @@
     }
   }
 
-  function statusText(payload) {
+  function statusText(payload, targetDate) {
     const policy = payload && payload.leavePolicy;
-    if (!policy) return gate(payload).message;
-    if (!policy.configured) return policy.error || gate(payload).message;
+    if (!policy) return gate(payload, targetDate).message;
+    const result = gate(payload, targetDate);
+    const lines = [];
+    // この案内は会社別の有給加算ではなく、JSONの基準公休数から作られる。
+    if (policy.baseHolidayMessage) lines.push(policy.baseHolidayMessage);
+    const terms = policy.tenure || {};
     const month = policy.viewMonth;
-    const text = `${month.year}年${month.month}月 公休 ${month.scheduledHolidays}/${month.requiredHolidays}日・有給 ${month.scheduledPaidLeave}/${month.requiredPaidLeave}日`;
-    return canPunch(payload) ? text : `${text}\n${gate(payload).message}`;
+    if (result.exemptReason === 'UNDER_SIX_MONTHS') {
+      lines.push('入社6か月未満の対象日は、従来どおり通常勤務・公休で登録できます。');
+      if (terms.eligibleFrom) lines.push(`公休・有給ルールの適用開始：${terms.eligibleFrom}`);
+      return lines.join('\n');
+    }
+    if (policy.company) lines.push(`所属企業：${policy.company}`);
+    if (policy.configured && month) {
+      if (month.legacyMode) lines.push(`登録済みの公休：${month.scheduledHolidays}日`);
+      else lines.push(`公休 ${month.scheduledHolidays}/${month.requiredHolidays}日・有給 ${month.scheduledPaidLeave}/${month.requiredPaidLeave}日`);
+    }
+    if (result.exemptReason === 'BEFORE_ROLLOUT') {
+      lines.push('2026年9月以前の打刻は、今回の制限対象外です。');
+    } else if (!policy.configured || (result.code && result.code !== 'TARGET_MONTH_LEAVE_INCOMPLETE')) {
+      lines.push(result.message || policy.error || '公休・有給設定を確認できません。');
+    } else if (result.allowed) {
+      lines.push('この月の公休・有給設定は完了しています。');
+    } else {
+      lines.push('公休・有給が未設定です。鉛筆から休みの日付を設定してください。');
+    }
+    if (month && terms.eligibleFrom) {
+      const ym = `${String(month.year).padStart(4, '0')}-${String(month.month).padStart(2, '0')}`;
+      if (terms.eligibleFrom.startsWith(ym)) {
+        lines.push(`${terms.eligibleFrom}より前の対象日は、今回の日数制限の対象外です。`);
+      }
+    }
+    return lines.filter(Boolean).join('\n');
   }
 
   function renderStatus(element, payload) {
