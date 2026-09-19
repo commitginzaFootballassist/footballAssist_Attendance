@@ -311,7 +311,7 @@
         <select id="punchInTimeSelect"></select>
       </div>
       <div class="hint">
-        派遣先の打刻時刻に合わせて選択してください。候補を増やす場合は「出勤時刻設定」から追加できます。
+        勤め先の打刻時刻に合わせて選択してください。候補を増やす場合は「出勤時刻設定」から追加できます。
       </div>
 
       <div class="modal-actions">
@@ -782,7 +782,7 @@
         el.dataset.state = 'locked';
         el.textContent = failureMessage || (isFetchingAttendance
           ? '公休・有給設定を確認中です。'
-          : '公休・有給設定を取得できません。更新版Lambdaを反映して、画面を再読込みしてください。');
+          : '公休・有給設定を取得できません。画面を再読込みしてください。');
         return;
       }
       const gate = AttendanceLeaveUI.gate(attendancePayload);
